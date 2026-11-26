@@ -12,7 +12,6 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -20,25 +19,29 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"time"
 
-	"golang.org/x/term"
 	"github.com/klauspost/compress/zstd"
+	"golang.org/x/term"
 )
 
 const (
 	requestTimeout = 15 * time.Second
-	appVersion     = "1.0.1"
+	appVersion     = "1.1.0"
 	red            = "\033[0;91m"
 	green          = "\033[0;92m"
 	yellow         = "\033[0;93m"
 	reset          = "\033[0m"
+	minFreeBytes   = 1536 * 1024 * 1024 // 1.5 GiB
 )
 
 func showLogo() {
@@ -84,28 +87,61 @@ func startSpinner() *spinner {
 
 func printError(msg string) {
 	fmt.Printf("%sError%s %s\n", red, reset, msg)
+	logf("Error %s\n", msg)
 }
 
 func printWarning(msg string) {
 	fmt.Printf("%sWarning%s %s\n", yellow, reset, msg)
+	logf("Warning %s\n", msg)
 }
 
 func printSuccess(version string) {
 	fmt.Printf("Update to %s %ssuccess%s\n", version, green, reset)
+	logf("Update to %s success\n", version)
 }
 
 func printFailed(version string, err error) {
 	fmt.Printf("Update to %s %sfailed%s\n", version, red, reset)
+	logf("Update to %s failed\n", version)
 	if err != nil {
 		msg := err.Error()
 		if msg != "" {
 			fmt.Println(msg)
+			logf("%s\n", msg)
 		}
 	}
 }
 
 func printReboot() {
 	fmt.Println("Reboot required to start the new kernel.")
+	logf("Reboot required to start the new kernel.\n")
+}
+
+// checkFreeSpace ensures at least minBytes are available on the filesystem holding path.
+func checkFreeSpace(path string, minBytes uint64) error {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
+		return fmt.Errorf("cannot stat filesystem %s: %w", path, err)
+	}
+	free := st.Bavail * uint64(st.Bsize)
+	if free < minBytes {
+		return fmt.Errorf("not enough free space on %s: need at least %s, available %s",
+			path, humanBytes(minBytes), humanBytes(free))
+	}
+	return nil
+}
+
+func humanBytes(b uint64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := uint64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
 // confirmYesNo reads a single key without Enter and returns true for y/н.
@@ -132,7 +168,7 @@ func confirmYesNo(prompt string) bool {
 		fmt.Print("\r\n")
 		return false
 	}
-	if buf[0] == 3 { // Ctrl+C
+	if buf[0] == 3 { // Ctrl+C in raw mode
 		fmt.Print("\r\n")
 		os.Exit(130)
 	}
@@ -140,8 +176,10 @@ func confirmYesNo(prompt string) bool {
 	yes := input == "y" || input == "н"
 	if yes {
 		fmt.Print("y\r\n")
+		logf("y\n")
 	} else {
 		fmt.Print("N\r\n")
+		logf("N\n")
 	}
 	return yes
 }
@@ -230,13 +268,73 @@ func checkEOL(oi OSInfo) (bool, string, error) {
 	return false, "", nil
 }
 
-var client *http.Client
-var verboseMode bool
-var chrootMode bool
+var (
+	client      *http.Client
+	verboseMode bool
+	chrootMode  bool
+	logFile     *os.File
+	ctrlCCount  int32
+	aptEnv      = []string{"NEEDRESTART_MODE=a", "DEBIAN_FRONTEND=noninteractive"}
+)
+
+// installCtrlCHandler exits immediately on the second Ctrl+C.
+func installCtrlCHandler() {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt)
+	go func() {
+		for range ch {
+			n := atomic.AddInt32(&ctrlCCount, 1)
+			if n == 1 {
+				fmt.Fprintf(os.Stderr, "\n%sInterrupted%s — press Ctrl+C again to force exit.\n", yellow, reset)
+				logf("Interrupted (first Ctrl+C)\n")
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "\n%sInterrupted by user, exiting.%s\n", red, reset)
+			logf("Interrupted by user, exiting.\n")
+			if logFile != nil {
+				logFile.Close()
+			}
+			os.Exit(130)
+		}
+	}()
+}
+
+// setupLog opens ./kernel_update.log in the current working directory.
+func setupLog() error {
+	f, err := os.OpenFile("kernel_update.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return err
+	}
+	logFile = f
+	fmt.Fprintf(f, "\n===== %s v%s (%s) =====\n", time.Now().Format("2006-01-02 15:04:05"), appVersion, runtime.GOOS)
+	return nil
+}
+
+// logf writes to the log file (if open) without touching the console.
+func logf(format string, args ...interface{}) {
+	if logFile == nil {
+		return
+	}
+	fmt.Fprintf(logFile, format, args...)
+}
 
 func command(name string, args ...string) (string, error) {
+	return commandEnv(nil, name, args...)
+}
+
+func commandEnv(env []string, name string, args ...string) (string, error) {
 	c := exec.Command(name, args...)
+	if env != nil {
+		c.Env = append(os.Environ(), env...)
+	}
 	b, err := c.CombinedOutput()
+	logf("$ %s %s\n", name, strings.Join(args, " "))
+	if len(b) > 0 {
+		logf("%s", string(b))
+		if !strings.HasSuffix(string(b), "\n") {
+			logf("\n")
+		}
+	}
 	if err != nil {
 		return string(b), fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(b)))
 	}
@@ -384,6 +482,7 @@ func get(url string) ([]byte, error) {
 	if client == nil {
 		return nil, errors.New("HTTP client is not initialized")
 	}
+	logf("HTTP GET %s\n", url)
 	if verboseMode {
 		fmt.Printf("HTTP GET %s\n", url)
 	}
@@ -402,6 +501,7 @@ func get(url string) ([]byte, error) {
 				err = fmt.Errorf("HTTP %s", r.Status)
 			}
 		}
+		logf("HTTP GET %s failed: %v\n", url, err)
 		last = err
 		time.Sleep(time.Duration(i+1) * time.Second)
 	}
@@ -519,9 +619,11 @@ func parseRepos() []Repo {
 	}
 	return out
 }
+
 func packagesURL(r Repo) string {
 	return strings.TrimRight(r.URI, "/") + "/dists/" + r.Suite + "/" + r.Component + "/binary-amd64/Packages.gz"
 }
+
 func packageRecords(data []byte) []map[string]string {
 	z, e := gzip.NewReader(strings.NewReader(string(data)))
 	if e != nil {
@@ -550,6 +652,7 @@ func packageRecords(data []byte) []map[string]string {
 	}
 	return out
 }
+
 func officialAPTURI(uri, id string) bool {
 	u, e := url.Parse(uri)
 	if e != nil {
@@ -569,6 +672,7 @@ func officialAPTURI(uri, id string) bool {
 	}
 	return false
 }
+
 func debVersionGreater(a, b string) bool {
 	if b == "" {
 		return true
@@ -671,6 +775,7 @@ func latestDistroKernel(osinfo OSInfo) (string, string, error) {
 	}
 	return bestMeta, bestImage, nil
 }
+
 func kernelOrgVersion() string {
 	b, e := get("https://www.kernel.org/releases.json")
 	if e != nil {
@@ -682,6 +787,7 @@ func kernelOrgVersion() string {
 	}
 	return k.LatestStable.Version
 }
+
 func installedKernelPackages() []string {
 	out, _ := command("dpkg-query", "-W", "-f=${binary:Package}\n", "linux-image-[0-9]*")
 	var p []string
@@ -690,6 +796,7 @@ func installedKernelPackages() []string {
 	}
 	return p
 }
+
 func isContainer() bool {
 	for _, p := range []string{"/.dockerenv", "/run/.containerenv", "/proc/vz"} {
 		if _, e := os.Stat(p); e == nil {
@@ -700,6 +807,7 @@ func isContainer() bool {
 	s := strings.ToLower(string(b))
 	return strings.Contains(s, "docker") || strings.Contains(s, "lxc") || strings.Contains(s, "kubepods") || strings.Contains(s, "containerd") || strings.Contains(s, "openvz")
 }
+
 func latestInstalledDebianKernel() string {
 	out, _ := command("dpkg-query", "-W", "-f=${binary:Package}\n", "linux-image-[0-9]*")
 	best := ""
@@ -712,6 +820,7 @@ func latestInstalledDebianKernel() string {
 	}
 	return best
 }
+
 func isChroot() bool {
 	root, err := os.Stat("/")
 	if err != nil {
@@ -723,8 +832,9 @@ func isChroot() bool {
 	}
 	return !os.SameFile(root, pid1Root)
 }
+
 func runApt(args ...string) error {
-	out, e := command("apt-get", args...)
+	out, e := commandEnv(aptEnv, "apt-get", args...)
 	if out != "" {
 		fmt.Print(out)
 	}
@@ -803,6 +913,7 @@ func parseRPMRepos() []RPMRepo {
 	}
 	return out
 }
+
 func officialRPMHost(u string, id string) bool {
 	x, e := url.Parse(u)
 	if e != nil {
@@ -823,6 +934,7 @@ func officialRPMHost(u string, id string) bool {
 	}
 	return false
 }
+
 func osVersionFallback(id string) string {
 	b, _ := os.ReadFile("/etc/os-release")
 	for _, l := range strings.Split(string(b), "\n") {
@@ -832,6 +944,7 @@ func osVersionFallback(id string) string {
 	}
 	return "0"
 }
+
 func resolveRPMBase(r RPMRepo, id string) ([]string, error) {
 	var bases []string
 	major := strings.SplitN(strings.TrimPrefix(osVersionFallback(id), ""), ".", 2)[0]
@@ -889,6 +1002,7 @@ func resolveRPMBase(r RPMRepo, id string) ([]string, error) {
 	}
 	return bases, nil
 }
+
 func rpmPrimary(base string) ([]RPMCandidate, error) {
 	rb, e := get(strings.TrimRight(base, "/") + "/repodata/repomd.xml")
 	if e != nil {
@@ -976,6 +1090,7 @@ func rpmPrimary(base string) ([]RPMCandidate, error) {
 	}
 	return out, nil
 }
+
 func rpmvercmp(a, b string) int { // rpm-style segment comparison
 	for a != "" || b != "" {
 		for len(a) > 0 && (a[0] == '~' || a[0] == '^' || !isAlphaNum(a[0])) {
@@ -1043,9 +1158,11 @@ func rpmvercmp(a, b string) int { // rpm-style segment comparison
 	}
 	return 1
 }
+
 func isAlphaNum(c byte) bool {
 	return c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
 }
+
 func isOfficialRPMRepo(r RPMRepo, id string) bool {
 	if officialRPMHost(r.BaseURL, id) || officialRPMHost(r.MirrorList, id) || officialRPMHost(r.Metalink, id) {
 		return true
@@ -1142,6 +1259,7 @@ func latestELRepoKernel(osinfo OSInfo) (RPMCandidate, error) {
 	}
 	return best, nil
 }
+
 func repoConfigured(name string) bool {
 	for _, r := range parseRPMRepos() {
 		if r.Name == name {
@@ -1158,6 +1276,7 @@ func isRPM(id string) bool {
 	}
 	return false
 }
+
 func runDNF(args ...string) error {
 	out, e := command("dnf", args...)
 	if out != "" {
@@ -1165,6 +1284,7 @@ func runDNF(args ...string) error {
 	}
 	return e
 }
+
 func rpmInstalledKernels() []string {
 	out, _ := command("rpm", "-qa", "--qf", "%{NAME} %{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n")
 	allowed := map[string]bool{"kernel": true, "kernel-core": true, "kernel-modules": true, "kernel-modules-core": true, "kernel-modules-extra": true, "kernel-uek": true, "kernel-uek-core": true, "kernel-uek-modules": true, "kernel-uek-modules-core": true, "kernel-ml": true, "kernel-ml-core": true, "kernel-ml-modules": true, "kernel-lt": true, "kernel-lt-core": true, "kernel-lt-modules": true}
@@ -1177,6 +1297,7 @@ func rpmInstalledKernels() []string {
 	}
 	return a
 }
+
 func latestInstalledRPMKernel(pkg string) string {
 	out, _ := command("rpm", "-q", pkg, "--qf", "%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n")
 	best := ""
@@ -1187,6 +1308,7 @@ func latestInstalledRPMKernel(pkg string) string {
 	}
 	return best
 }
+
 func runningRPMKernelPackage() (string, string) {
 	out, _ := command("rpm", "-qf", "--qf", "%{NAME}|%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}", "/boot/vmlinuz-"+strings.TrimSpace(string(must(os.ReadFile("/proc/sys/kernel/osrelease")))))
 	p := strings.SplitN(strings.TrimSpace(out), "|", 2)
@@ -1195,6 +1317,7 @@ func runningRPMKernelPackage() (string, string) {
 	}
 	return p[0], p[1]
 }
+
 func runRPMUpdate(candidate RPMCandidate, install string, force bool, repo string) error {
 	target := install + "-" + strings.TrimPrefix(candidate.EVR, "0:") + "." + candidate.Arch
 	extra := []string{}
@@ -1258,7 +1381,24 @@ func runRPMUpdate(candidate RPMCandidate, install string, force bool, repo strin
 	}
 
 	// Retain the running kernel and the newest installed kernel; preview removal before execution.
-	runningName, runningEVR := runningRPMKernelPackage()
+	// In chroot the running kernel is not reliable from procfs, so keep the latest installed kernel.
+	runningName, runningEVR := "", ""
+	if chrootMode {
+		pkgRunning := "kernel-core"
+		if strings.HasPrefix(candidate.Name, "kernel-uek") {
+			pkgRunning = "kernel-uek-core"
+		} else if strings.HasPrefix(candidate.Name, "kernel-ml") {
+			pkgRunning = "kernel-ml-core"
+		} else if strings.HasPrefix(candidate.Name, "kernel-lt") {
+			pkgRunning = "kernel-lt-core"
+		}
+		if v := latestInstalledRPMKernel(pkgRunning); v != "" {
+			runningEVR = v
+			runningName = strings.TrimSuffix(pkgRunning, "-core")
+		}
+	} else {
+		runningName, runningEVR = runningRPMKernelPackage()
+	}
 	installed := rpmInstalledKernels()
 	var remove []string
 	targetEVR := strings.TrimPrefix(candidate.EVR, "0:")
@@ -1315,11 +1455,12 @@ func runRPMUpdate(candidate RPMCandidate, install string, force bool, repo strin
 	}
 
 	if force && !chrootMode {
-		_, e := command("systemctl", "reboot")
+		_, e := command("systemctl", "reboot", "-i")
 		return e
 	}
 	return nil
 }
+
 func unique(a []string) []string {
 	m := map[string]bool{}
 	var o []string
@@ -1331,6 +1472,7 @@ func unique(a []string) []string {
 	}
 	return o
 }
+
 func updateRHELGrubQuiet() error {
 	if out, e := command("dnf", "clean", "metadata"); e != nil {
 		return fmt.Errorf("dnf clean metadata failed: %w: %s", e, strings.TrimSpace(out))
@@ -1375,6 +1517,7 @@ func updateRHELGrubQuiet() error {
 	}
 	return errors.New("grub2-mkconfig not found")
 }
+
 func updateRHELGrub() error {
 	if out, e := command("dnf", "clean", "metadata"); out != "" {
 		fmt.Print(out)
@@ -1428,10 +1571,12 @@ func updateRHELGrub() error {
 	}
 	return errors.New("grub2-mkconfig not found")
 }
+
 func isWSL() bool {
 	b, _ := os.ReadFile("/proc/version")
 	return strings.Contains(strings.ToLower(string(b)), "microsoft")
 }
+
 func isVirtualization() string {
 	b, _ := os.ReadFile("/sys/class/dmi/id/sys_vendor")
 	s := strings.ToLower(string(b))
@@ -1445,11 +1590,28 @@ func isVirtualization() string {
 
 func cleanupDebianKernels(newImage string) error {
 	installed := installedKernelPackages()
-	running := "linux-image-" + strings.TrimSpace(string(must(os.ReadFile("/proc/sys/kernel/osrelease"))))
+	var keep []string
+	if chrootMode {
+		// In chroot there is no reliable running kernel from procfs.
+		// Keep the latest installed kernel and the newly installed one.
+		if v := latestInstalledDebianKernel(); v != "" {
+			keep = append(keep, "linux-image-"+v)
+		}
+	} else {
+		keep = append(keep, "linux-image-"+strings.TrimSpace(string(must(os.ReadFile("/proc/sys/kernel/osrelease")))))
+	}
+	keep = append(keep, newImage)
 	var remove []string
 	for _, p := range installed {
 		normalized := strings.TrimSuffix(p, ":amd64")
-		if normalized == running || normalized == newImage || strings.Contains(newImage, strings.TrimPrefix(normalized, "linux-image-")) {
+		skip := false
+		for _, k := range keep {
+			if normalized == k || strings.Contains(newImage, strings.TrimPrefix(normalized, "linux-image-")) {
+				skip = true
+				break
+			}
+		}
+		if skip {
 			continue
 		}
 		if regexp.MustCompile(`^linux-image-[0-9]`).MatchString(p) {
@@ -1470,7 +1632,7 @@ func cleanupDebianKernels(newImage string) error {
 			return fmt.Errorf("removal dry-run failed; stopped: %w", e)
 		}
 	} else {
-		if out, e := command("apt-get", args...); e != nil {
+		if out, e := commandEnv(aptEnv, "apt-get", args...); e != nil {
 			return fmt.Errorf("removal dry-run failed; stopped: %w: %s", e, strings.TrimSpace(out))
 		}
 	}
@@ -1478,12 +1640,13 @@ func cleanupDebianKernels(newImage string) error {
 	if verboseMode {
 		return runApt(args...)
 	}
-	out, e := command("apt-get", args...)
+	out, e := commandEnv(aptEnv, "apt-get", args...)
 	if e != nil {
 		return fmt.Errorf("%w: %s", e, strings.TrimSpace(out))
 	}
 	return nil
 }
+
 // prepareOfficialRPMRepos temporarily replaces enabled RPM repositories with
 // the official ones for the detected distribution, returns a restore function.
 func prepareOfficialRPMRepos(id, version string) (func(), error) {
@@ -1706,6 +1869,7 @@ gpgcheck=0
 	}
 	return restore, nil
 }
+
 // officialRPMRepos returns the official base URLs for the detected distro.
 func officialRPMRepos(id, version string) []string {
 	major := strings.SplitN(version, ".", 2)[0]
@@ -1747,6 +1911,7 @@ func officialRPMRepos(id, version string) []string {
 		return []string{
 			fmt.Sprintf("https://repo.almalinux.org/almalinux/%s/BaseOS/x86_64/os/", major),
 			fmt.Sprintf("https://repo.almalinux.org/almalinux/%s/AppStream/x86_64/os/", major),
+			fmt.Sprintf("https://repo.almalinux.org/almalinux/%s/AppStream/x86_64/os/", major),
 		}
 	case "rhel":
 		switch major {
@@ -1779,65 +1944,83 @@ func officialRPMRepos(id, version string) []string {
 	return nil
 }
 
+func usage() {
+	fmt.Fprintf(os.Stderr, "Usage: %s [options]\n", filepath.Base(os.Args[0]))
+	fmt.Fprintf(os.Stderr, "Options:\n")
+	fmt.Fprintf(os.Stderr, "  -h, --help                 show this help\n")
+	fmt.Fprintf(os.Stderr, "  -v, --version              show version\n")
+	fmt.Fprintf(os.Stderr, "  --verbose                  enable extended logging\n")
+	fmt.Fprintf(os.Stderr, "  --force-reboot             reboot after successful update\n")
+	fmt.Fprintf(os.Stderr, "  --proxy URL                HTTP/HTTPS/SOCKS5 proxy URL\n")
+	fmt.Fprintf(os.Stderr, "                             e.g. http://user:pass@1.1.1.1:3128\n")
+	fmt.Fprintf(os.Stderr, "                                  socks5://user:pass@1.1.1.1:1080\n")
+}
+
 func main() {
-	// The standard flag package stops at the first positional argument; move the mode last
-	// so both `kernel_update --force-reboot update` and `kernel_update update --force-reboot` work.
+	proxy := ""
+	force := false
+	verbose := false
+
 	args := os.Args[1:]
-	var positional []string
-	var options []string
 	for i := 0; i < len(args); i++ {
 		a := args[i]
-		if a == "check" || a == "update" {
-			positional = append(positional, a)
-			continue
-		}
-		options = append(options, a)
-		if (a == "--proxy" || a == "-proxy") && i+1 < len(args) {
+		switch {
+		case a == "-h" || a == "--help":
+			usage()
+			os.Exit(0)
+		case a == "-v" || a == "--version":
+			fmt.Printf("kernel_update %s\n", appVersion)
+			os.Exit(0)
+		case a == "--verbose":
+			verbose = true
+		case a == "--force-reboot":
+			force = true
+		case a == "--proxy":
+			if i+1 >= len(args) {
+				fmt.Fprintf(os.Stderr, "error: --proxy requires a value\n")
+				os.Exit(2)
+			}
 			i++
-			options = append(options, args[i])
-		}
-	}
-	os.Args = append([]string{os.Args[0]}, append(options, positional...)...)
-
-	// version flag handled early
-	proxy := flag.String("proxy", "", "HTTP/HTTPS/SOCKS5 proxy URL")
-	force := flag.Bool("force-reboot", false, "reboot after successful update")
-	verbose := flag.Bool("verbose", false, "enable extended logging")
-	showVersion := flag.Bool("v", false, "show version")
-	showVersionLong := flag.Bool("version", false, "show version")
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [check|update] [options]\n", filepath.Base(os.Args[0]))
-		fmt.Fprintf(os.Stderr, "Options:\n")
-		flag.PrintDefaults()
-	}
-	flag.Parse()
-	if *showVersion || *showVersionLong {
-		fmt.Printf("kernel_update %s\n", appVersion)
-		return
-	}
-	if flag.NArg() > 0 {
-		pos := flag.Arg(0)
-		if pos != "check" && pos != "update" {
-			fmt.Fprintf(os.Stderr, "usage: kernel_update [check|update] [--proxy URL] [--force-reboot] [--verbose] [-v|--version]\n")
+			proxy = args[i]
+		case strings.HasPrefix(a, "--proxy="):
+			proxy = strings.TrimPrefix(a, "--proxy=")
+		default:
+			fmt.Fprintf(os.Stderr, "error: unknown argument %q\n", a)
+			usage()
 			os.Exit(2)
 		}
 	}
-	verboseMode = *verbose
-	// Show logo only in interactive check/update mode.
+	verboseMode = verbose
 	showLogo()
+
+	if err := setupLog(); err != nil {
+		fmt.Fprintf(os.Stderr, "%sWarning%s cannot open log file: %v\n", yellow, reset, err)
+	} else {
+		defer logFile.Close()
+	}
+	installCtrlCHandler()
+
+	if err := checkFreeSpace(".", minFreeBytes); err != nil {
+		printError(err.Error())
+		os.Exit(1)
+	}
 
 	oi, e := readOS()
 	if e != nil {
 		fmt.Fprintln(os.Stderr, e)
+		logf("%v\n", e)
 		os.Exit(1)
 	}
 	if runtime.GOARCH != "amd64" {
-		fmt.Printf("Unsupported architecture: %s (only x86_64)\n", runtime.GOARCH)
+		msg := fmt.Sprintf("Unsupported architecture: %s (only x86_64)", runtime.GOARCH)
+		fmt.Println(msg)
+		logf("%s\n", msg)
 		os.Exit(1)
 	}
-	client, e = httpClient(*proxy)
+	client, e = httpClient(proxy)
 	if e != nil {
 		fmt.Fprintln(os.Stderr, e)
+		logf("%v\n", e)
 		os.Exit(1)
 	}
 
@@ -1845,31 +2028,57 @@ func main() {
 	if eol, date, err := checkEOL(oi); err == nil && eol {
 		printError(fmt.Sprintf("this OS (%s %s) reached end-of-life on %s.", oi.ID, oi.Version, date))
 		fmt.Println()
-		fmt.Println("No official kernel update available.")
+		logf("\n")
+		msg := "No official kernel update available."
+		fmt.Println(msg)
+		logf("%s\n", msg)
 		if isRPM(oi.ID) {
 			if cand, _, er := latestRPMKernel(oi); er == nil && cand.EVR != "" {
-				fmt.Printf("Latest kernel version was - %s.\n", strings.TrimPrefix(cand.EVR, "0:"))
+				line := fmt.Sprintf("Latest kernel version was - %s.", strings.TrimPrefix(cand.EVR, "0:"))
+				fmt.Println(line)
+				logf("%s\n", line)
 			}
 		} else if oi.ID == "debian" || oi.ID == "ubuntu" {
 			if _, image, er := latestDistroKernel(oi); er == nil && image != "" {
-				fmt.Printf("Latest kernel version was - %s.\n", strings.TrimPrefix(image, "linux-image-"))
+				line := fmt.Sprintf("Latest kernel version was - %s.", strings.TrimPrefix(image, "linux-image-"))
+				fmt.Println(line)
+				logf("%s\n", line)
 			}
 		}
 		os.Exit(1)
 	}
 
-	runningKernel := strings.TrimSpace(string(must(os.ReadFile("/proc/sys/kernel/osrelease"))))
 	chrootMode = isChroot()
-	current := runningKernel
+	runningKernel := ""
+	current := ""
 	if chrootMode {
-		current = "unknown (chroot; running Rescue kernel: " + runningKernel + ")"
+		if isRPM(oi.ID) {
+			pkg := "kernel-core"
+			if oi.ID == "ol" {
+				pkg = "kernel-uek-core"
+			}
+			runningKernel = strings.TrimPrefix(latestInstalledRPMKernel(pkg), "0:")
+		} else if oi.ID == "debian" || oi.ID == "ubuntu" {
+			runningKernel = latestInstalledDebianKernel()
+		}
+		if runningKernel == "" {
+			runningKernel = "unknown"
+		}
+		current = runningKernel
+	} else {
+		runningKernel = strings.TrimSpace(string(must(os.ReadFile("/proc/sys/kernel/osrelease"))))
+		current = runningKernel
 	}
 	if isWSL() {
-		fmt.Println("WSL detected: update the kernel using the Windows/WSL update mechanism.")
+		msg := "WSL detected: update the kernel using the Windows/WSL update mechanism."
+		fmt.Println(msg)
+		logf("%s\n", msg)
 		return
 	}
 	if isContainer() {
-		fmt.Println("Container detected: the kernel must be updated on the parent host.")
+		msg := "Container detected: the kernel must be updated on the parent host."
+		fmt.Println(msg)
+		logf("%s\n", msg)
 		return
 	}
 	virt := isVirtualization()
@@ -1928,15 +2137,24 @@ func main() {
 		}
 
 		if !updateAvailable && !elrepoNewer {
-			// Running kernel equals latest available: nothing to do.
+			msg := fmt.Sprintf("Running kernel %s is the latest available for this OS.", strings.TrimPrefix(currentEVR, "0:"))
 			fmt.Printf("Running kernel %s is the %slatest available%s for this OS.\n", strings.TrimPrefix(currentEVR, "0:"), green, reset)
+			logf("%s\n", msg)
 			return
 		}
 
-		// Latest official kernel is already installed, but a reboot has not been performed yet.
 		if !chrootMode && installedEVR != "" && rpmvercmp(installedEVR, currentEVR) > 0 && rpmvercmp(cand.EVR, installedEVR) <= 0 && !elrepoNewer {
+			msg := fmt.Sprintf("Running kernel - %s.\nInstalled kernel - %s is the latest available.\nReboot OS to use it.",
+				strings.TrimPrefix(currentEVR, "0:"), strings.TrimPrefix(installedEVR, "0:"))
 			fmt.Printf("Running kernel - %s.\nInstalled kernel - %s is the latest available.\n%sReboot OS to use it.%s\n",
 				strings.TrimPrefix(currentEVR, "0:"), strings.TrimPrefix(installedEVR, "0:"), green, reset)
+			logf("%s\n", msg)
+			if force {
+				if _, e := command("systemctl", "reboot", "-i"); e != nil {
+					printError(e.Error())
+					os.Exit(1)
+				}
+			}
 			return
 		}
 
@@ -1947,26 +2165,57 @@ func main() {
 			}
 			defer restore()
 			if useELRepo {
-				return runRPMUpdate(elrepo, "kernel-ml", *force, "elrepo-kernel")
+				return runRPMUpdate(elrepo, "kernel-ml", force, "elrepo-kernel")
 			}
-			return runRPMUpdate(cand, install, *force, "")
+			return runRPMUpdate(cand, install, force, "")
 		}
 
 		if elrepoNewer && repoConfigured("elrepo-kernel") {
-			if confirmYesNo(fmt.Sprintf("Install the newer third-party ELRepo kernel %s instead of the distribution kernel? [y/N]: ", elrepo.EVR)) {
+			doELRepo := force
+			if !doELRepo {
+				prompt := fmt.Sprintf("Install the newer third-party ELRepo kernel %s instead of the distribution kernel? [y/N]: ", elrepo.EVR)
+				logf("%s", prompt)
+				doELRepo = confirmYesNo(prompt)
+			}
+			if doELRepo {
 				if e = installRPM(true); e != nil {
 					printFailed(strings.TrimPrefix(elrepo.EVR, "0:"), e)
 					os.Exit(1)
 				}
 				printSuccess(strings.TrimPrefix(elrepo.EVR, "0:"))
-				printReboot()
+				if force {
+					if _, e := command("systemctl", "reboot", "-i"); e != nil {
+						printError(e.Error())
+						os.Exit(1)
+					}
+				} else {
+					printReboot()
+				}
 				return
 			}
 		}
 		if !updateAvailable {
-			// No newer official kernel; user declined the newer ELRepo kernel.
 			return
 		}
+		if force {
+			if e = installRPM(false); e != nil {
+				printFailed(strings.TrimPrefix(cand.EVR, "0:"), e)
+				os.Exit(1)
+			}
+			printSuccess(strings.TrimPrefix(cand.EVR, "0:"))
+			if !chrootMode {
+				if _, e := command("systemctl", "reboot", "-i"); e != nil {
+					printError(e.Error())
+					os.Exit(1)
+				}
+			} else {
+				msg := "Exit chroot and reboot the host manually to start the installed kernel."
+				fmt.Println(msg)
+				logf("%s\n", msg)
+			}
+			return
+		}
+		logf("Install the latest kernel available ? [y/N]: ")
 		if !confirmYesNo("Install the latest kernel available ? [y/N]: ") {
 			return
 		}
@@ -1976,7 +2225,9 @@ func main() {
 		}
 		printSuccess(strings.TrimPrefix(cand.EVR, "0:"))
 		if chrootMode {
-			fmt.Println("Exit chroot and reboot the host manually to start the installed kernel.")
+			msg := "Exit chroot and reboot the host manually to start the installed kernel."
+			fmt.Println(msg)
+			logf("%s\n", msg)
 		} else {
 			printReboot()
 		}
@@ -2022,18 +2273,24 @@ func main() {
 		}
 
 		if !updateAvailable {
+			msg := fmt.Sprintf("Running kernel %s is the latest available for this OS.", currentVersion)
 			fmt.Printf("Running kernel %s is the %slatest available%s for this OS.\n", currentVersion, green, reset)
+			logf("%s\n", msg)
 			return
 		}
 
-		// Latest official kernel is already installed, but a reboot has not been performed yet.
 		if !chrootMode && installedVersion != "" && debVersionGreater(installedVersion, currentVersion) && !debVersionGreater(imageVersion, installedVersion) {
+			msg := fmt.Sprintf("Running kernel - %s.\nInstalled kernel - %s is the latest available.\nReboot OS to use it.",
+				currentVersion, installedVersion)
 			fmt.Printf("Running kernel - %s.\nInstalled kernel - %s is the latest available.\n%sReboot OS to use it.%s\n",
 				currentVersion, installedVersion, green, reset)
-			return
-		}
-
-		if !confirmYesNo("Install the latest kernel available ? [y/N]: ") {
+			logf("%s\n", msg)
+			if force {
+				if _, e := command("systemctl", "reboot", "-i"); e != nil {
+					printError(e.Error())
+					os.Exit(1)
+				}
+			}
 			return
 		}
 
@@ -2066,12 +2323,10 @@ func main() {
 				content := fmt.Sprintf("deb http://archive.ubuntu.com/ubuntu %s main\ndeb http://security.ubuntu.com/ubuntu %s-security main\n", oi.Codename, oi.Codename)
 				os.WriteFile(filepath.Join(officialDir, "99-kernel_update-official.list"), []byte(content), 0644)
 			}
-			// Refresh package indexes from the temporary official sources.
 			if verboseMode {
 				fmt.Println("Refreshing package indexes from official sources: apt-get update")
 			}
-			if _, err := command("apt-get", "update"); err != nil && !verboseMode {
-				// apt-get update may return non-zero on some warnings; surface the output for debugging.
+			if _, err := commandEnv(aptEnv, "apt-get", "update"); err != nil && !verboseMode {
 				fmt.Println(err.Error())
 			}
 			restoreApt := func() {
@@ -2092,7 +2347,7 @@ func main() {
 				if verboseMode {
 					return runApt(args...)
 				}
-				out, e := command("apt-get", args...)
+				out, e := commandEnv(aptEnv, "apt-get", args...)
 				if e != nil {
 					return fmt.Errorf("%w: %s", e, strings.TrimSpace(out))
 				}
@@ -2122,22 +2377,39 @@ func main() {
 			return nil
 		}
 
+		if force {
+			if e = installApt(); e != nil {
+				printFailed(imageVersion, e)
+				os.Exit(1)
+			}
+			printSuccess(imageVersion)
+			if !chrootMode {
+				if _, e := command("systemctl", "reboot", "-i"); e != nil {
+					printError(e.Error())
+					os.Exit(1)
+				}
+			} else {
+				msg := "Exit chroot and reboot the host manually to start the installed kernel."
+				fmt.Println(msg)
+				logf("%s\n", msg)
+			}
+			return
+		}
+		logf("Install the latest kernel available ? [y/N]: ")
+		if !confirmYesNo("Install the latest kernel available ? [y/N]: ") {
+			return
+		}
 		if e = installApt(); e != nil {
 			printFailed(imageVersion, e)
 			os.Exit(1)
 		}
 		printSuccess(imageVersion)
 		if chrootMode {
-			fmt.Println("Exit chroot and reboot the host manually to start the installed kernel.")
+			msg := "Exit chroot and reboot the host manually to start the installed kernel."
+			fmt.Println(msg)
+			logf("%s\n", msg)
 		} else {
 			printReboot()
-		}
-		if *force {
-			_, e = command("systemctl", "reboot")
-			if e != nil {
-				printError(e.Error())
-				os.Exit(1)
-			}
 		}
 		return
 	}
