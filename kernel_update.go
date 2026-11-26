@@ -34,7 +34,7 @@ import (
 
 const (
 	requestTimeout = 15 * time.Second
-	appVersion     = "1.0.0"
+	appVersion     = "1.0.1"
 	red            = "\033[0;91m"
 	green          = "\033[0;92m"
 	yellow         = "\033[0;93m"
@@ -1060,10 +1060,6 @@ func isOfficialRPMRepo(r RPMRepo, id string) bool {
 }
 
 func latestRPMKernel(osinfo OSInfo) (RPMCandidate, string, error) {
-	repos := parseRPMRepos()
-	if len(repos) == 0 {
-		return RPMCandidate{}, "", errors.New("enabled RPM repositories not found")
-	}
 	pkg := "kernel-core"
 	install := "kernel"
 	if osinfo.ID == "ol" { // Oracle UEK is preferred only when UEK repo is configured and publishes UEK packages.
@@ -1072,25 +1068,20 @@ func latestRPMKernel(osinfo OSInfo) (RPMCandidate, string, error) {
 	}
 	var best RPMCandidate
 	var errs []string
-	for _, r := range repos {
-		if !isOfficialRPMRepo(r, osinfo.ID) {
-			continue
-		}
-		bases, e := resolveRPMBase(r, osinfo.ID)
-		if verboseMode {
-			fmt.Printf("[rpm] %s -> %d base urls\n", r.Name, len(bases))
-			for _, b := range bases {
-				fmt.Printf("[rpm]   %s\n", b)
-			}
-		}
-		if e != nil {
-			errs = append(errs, e.Error())
-			continue
-		}
+	seenBase := map[string]bool{}
+
+	scanBases := func(repoName string, bases []string) {
 		for _, base := range bases {
+			if base == "" || seenBase[base] {
+				continue
+			}
+			seenBase[base] = true
+			if verboseMode {
+				fmt.Printf("[rpm] %s: base=%s\n", repoName, base)
+			}
 			ps, e := rpmPrimary(base)
 			if e != nil {
-				errs = append(errs, e.Error())
+				errs = append(errs, fmt.Sprintf("%s: %v", base, e))
 				continue
 			}
 			for _, p := range ps {
@@ -1099,16 +1090,34 @@ func latestRPMKernel(osinfo OSInfo) (RPMCandidate, string, error) {
 				}
 				if best.EVR == "" || rpmvercmp(p.EVR, best.EVR) > 0 {
 					best = p
-					best.Repo = r.Name
+					best.Repo = repoName
 				}
 			}
 		}
 	}
+
+	// Primary source: official base URLs derived from distro ID + major version.
+	scanBases("official", officialRPMRepos(osinfo.ID, osinfo.Version))
+
+	// Secondary source: enabled local .repo entries that point to official hosts.
+	for _, r := range parseRPMRepos() {
+		if !isOfficialRPMRepo(r, osinfo.ID) {
+			continue
+		}
+		bases, e := resolveRPMBase(r, osinfo.ID)
+		if e != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", r.Name, e))
+			continue
+		}
+		scanBases(r.Name, bases)
+	}
+
 	if best.EVR == "" {
 		return best, "", fmt.Errorf("cannot find %s in official online RPM metadata: %s", pkg, strings.Join(errs, "; "))
 	}
 	return best, install, nil
 }
+
 func latestELRepoKernel(osinfo OSInfo) (RPMCandidate, error) {
 	major := strings.SplitN(osinfo.Version, ".", 2)[0]
 	if major != "8" && major != "9" && major != "10" {
@@ -1696,6 +1705,78 @@ gpgcheck=0
 		return nil, e
 	}
 	return restore, nil
+}
+// officialRPMRepos returns the official base URLs for the detected distro.
+func officialRPMRepos(id, version string) []string {
+	major := strings.SplitN(version, ".", 2)[0]
+	switch id {
+	case "centos":
+		switch major {
+		case "10":
+			return []string{
+				"https://mirror.stream.centos.org/10-stream/BaseOS/x86_64/os/",
+				"https://mirror.stream.centos.org/10-stream/AppStream/x86_64/os/",
+			}
+		case "9":
+			return []string{
+				"https://mirror.stream.centos.org/9-stream/BaseOS/x86_64/os/",
+				"https://mirror.stream.centos.org/9-stream/AppStream/x86_64/os/",
+			}
+		case "8":
+			return []string{
+				"https://vault.centos.org/8-stream/BaseOS/x86_64/os/",
+				"https://vault.centos.org/8-stream/AppStream/x86_64/os/",
+			}
+		case "7":
+			return []string{
+				"https://vault.centos.org/7.9.2009/os/x86_64/",
+				"https://vault.centos.org/7.9.2009/updates/x86_64/",
+			}
+		case "6":
+			return []string{
+				"https://vault.centos.org/6.10/os/x86_64/",
+				"https://vault.centos.org/6.10/updates/x86_64/",
+			}
+		}
+	case "rocky":
+		return []string{
+			fmt.Sprintf("https://dl.rockylinux.org/pub/rocky/%s/BaseOS/x86_64/os/", major),
+			fmt.Sprintf("https://dl.rockylinux.org/pub/rocky/%s/AppStream/x86_64/os/", major),
+		}
+	case "almalinux":
+		return []string{
+			fmt.Sprintf("https://repo.almalinux.org/almalinux/%s/BaseOS/x86_64/os/", major),
+			fmt.Sprintf("https://repo.almalinux.org/almalinux/%s/AppStream/x86_64/os/", major),
+		}
+	case "rhel":
+		switch major {
+		case "10":
+			return []string{
+				"https://cdn.redhat.com/content/dist/rhel10/10/x86_64/baseos/os",
+				"https://cdn.redhat.com/content/dist/rhel10/10/x86_64/appstream/os",
+			}
+		case "9":
+			return []string{
+				"https://cdn.redhat.com/content/dist/rhel9/9/x86_64/baseos/os",
+				"https://cdn.redhat.com/content/dist/rhel9/9/x86_64/appstream/os",
+			}
+		case "8":
+			return []string{
+				"https://cdn.redhat.com/content/dist/rhel8/8/x86_64/baseos/os",
+				"https://cdn.redhat.com/content/dist/rhel8/8/x86_64/appstream/os",
+			}
+		case "7":
+			return []string{"https://cdn.redhat.com/content/dist/rhel/server/7/7Server/x86_64/os"}
+		case "6":
+			return []string{"https://cdn.redhat.com/content/dist/rhel/server/6/6Server/x86_64/os"}
+		}
+	case "ol":
+		return []string{
+			fmt.Sprintf("https://yum.oracle.com/repo/OracleLinux/OL%s/baseos/latest/x86_64/", major),
+			fmt.Sprintf("https://yum.oracle.com/repo/OracleLinux/OL%s/appstream/latest/x86_64/", major),
+		}
+	}
+	return nil
 }
 
 func main() {
