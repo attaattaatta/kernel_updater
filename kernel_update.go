@@ -37,7 +37,7 @@ import (
 
 const (
 	requestTimeout = 15 * time.Second
-	appVersion     = "1.1.0"
+	appVersion     = "1.2.0"
 	red            = "\033[0;91m"
 	green          = "\033[0;92m"
 	yellow         = "\033[0;93m"
