@@ -69,16 +69,16 @@ func startSpinner() *spinner {
 	go func() {
 		frames := []string{"--", "\\", "|", "/"}
 		i := 0
-		fmt.Printf("\rWorking %s ", frames[i])
+		fmt.Printf("\rWorking (logging to ./kernel_update.log) %s ", frames[i])
 		for {
 			select {
 			case <-s.stop:
-				fmt.Printf("\rWorking     \r")
+				fmt.Printf("\rWorking (logging to ./kernel_update.log)     \r")
 				close(s.done)
 				return
 			case <-time.After(120 * time.Millisecond):
 				i = (i + 1) % len(frames)
-				fmt.Printf("\rWorking %s ", frames[i])
+				fmt.Printf("\rWorking (logging to ./kernel_update.log) %s ", frames[i])
 			}
 		}
 	}()
