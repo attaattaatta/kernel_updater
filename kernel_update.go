@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/zstd"
+	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 )
 
@@ -42,6 +43,7 @@ const (
 	yellow         = "\033[0;93m"
 	reset          = "\033[0m"
 	minFreeBytes   = 1536 * 1024 * 1024 // 1.5 GiB
+	maxLogBytes    = 20 * 1024 * 1024   // 20 MiB
 )
 
 func showLogo() {
@@ -57,6 +59,16 @@ func showLogo() {
 		time.Sleep(100 * time.Millisecond)
 	}
 	fmt.Printf("\n%sv%s%s (Linux kernel updater)\n\n", yellow, appVersion, reset)
+}
+
+// requireRoot exits with a clear message if the process is not running as root.
+func requireRoot() {
+	if os.Geteuid() == 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%sError%s this tool must be run as root (try: sudo %s).\n",
+		red, reset, filepath.Base(os.Args[0]))
+	os.Exit(1)
 }
 
 type spinner struct {
@@ -83,6 +95,25 @@ func startSpinner() *spinner {
 		}
 	}()
 	return s
+}
+
+// truncateLogIfLarge removes ./kernel_update.log when it exceeds maxLogBytes.
+// It is called before the log file is opened so the file can be recreated fresh.
+func truncateLogIfLarge(path string, limit int64) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if fi.Size() <= limit {
+		return nil
+	}
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	return nil
 }
 
 func printError(msg string) {
@@ -223,6 +254,8 @@ func eolProductID(id string) string {
 		return "almalinux"
 	case "ol":
 		return "oracle-linux"
+	case "fedora":
+		return "fedora"
 	}
 	return ""
 }
@@ -275,7 +308,65 @@ var (
 	logFile     *os.File
 	ctrlCCount  int32
 	aptEnv      = []string{"NEEDRESTART_MODE=a", "DEBIAN_FRONTEND=noninteractive"}
+	errLocked   = errors.New("lock is held by another process")
 )
+
+type lockHandle struct {
+	f    *os.File
+	path string
+}
+
+// acquireLock takes an exclusive non-blocking flock on path and records
+// the current PID inside the file. On conflict it returns the PID of the
+// holder (0 if unknown) so the caller can print a helpful message.
+func acquireLock(path string) (*lockHandle, int, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		pid := readLockPID(f)
+		f.Close()
+		if errors.Is(err, unix.EWOULDBLOCK) {
+			return nil, pid, errLocked
+		}
+		return nil, pid, err
+	}
+	// We own the lock: rewrite the PID atomically under the lock.
+	_ = f.Truncate(0)
+	_, _ = f.Seek(0, 0)
+	fmt.Fprintf(f, "%d\n", os.Getpid())
+	return &lockHandle{f: f, path: path}, 0, nil
+}
+
+// Release drops the flock. The file itself is intentionally left in place:
+// unlinking a lock file while another process may still hold the old inode
+// is a classic race and provides no benefit here.
+func (l *lockHandle) Release() {
+	if l == nil || l.f == nil {
+		return
+	}
+	_ = unix.Flock(int(l.f.Fd()), unix.LOCK_UN)
+	_ = l.f.Close()
+	l.f = nil
+}
+
+func readLockPID(f *os.File) int {
+	b := make([]byte, 64)
+	n, _ := f.ReadAt(b, 0)
+	s := strings.TrimSpace(string(b[:n]))
+	pid, _ := strconv.Atoi(s)
+	return pid
+}
+
+// lockPath picks a lock location that works both on a normal host and in a
+// chroot where /run may be unavailable.
+func lockPath() string {
+	if _, err := os.Stat("/run"); err == nil {
+		return "/run/kernel_update.lock"
+	}
+	return filepath.Join(os.TempDir(), "kernel_update.lock")
+}
 
 // installCtrlCHandler exits immediately on the second Ctrl+C.
 func installCtrlCHandler() {
@@ -301,6 +392,9 @@ func installCtrlCHandler() {
 
 // setupLog opens ./kernel_update.log in the current working directory.
 func setupLog() error {
+	if err := truncateLogIfLarge("kernel_update.log", maxLogBytes); err != nil {
+		return fmt.Errorf("cannot truncate log file: %w", err)
+	}
 	f, err := os.OpenFile("kernel_update.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return err
@@ -653,26 +747,6 @@ func packageRecords(data []byte) []map[string]string {
 	return out
 }
 
-func officialAPTURI(uri, id string) bool {
-	u, e := url.Parse(uri)
-	if e != nil {
-		return false
-	}
-	h := strings.ToLower(u.Hostname())
-	domains := []string{}
-	if id == "debian" {
-		domains = []string{"debian.org"}
-	} else if id == "ubuntu" {
-		domains = []string{"ubuntu.com"}
-	}
-	for _, d := range domains {
-		if h == d || strings.HasSuffix(h, "."+d) {
-			return true
-		}
-	}
-	return false
-}
-
 func debVersionGreater(a, b string) bool {
 	if b == "" {
 		return true
@@ -852,17 +926,6 @@ type Repomd struct {
 			Href string `xml:"href,attr"`
 		} `xml:"location"`
 	} `xml:"data"`
-}
-type RPMPrimary struct {
-	Packages []struct {
-		Name    string `xml:"name"`
-		Arch    string `xml:"arch"`
-		Version struct {
-			Epoch string `xml:"epoch,attr"`
-			Ver   string `xml:"ver,attr"`
-			Rel   string `xml:"rel,attr"`
-		} `xml:"version"`
-	} `xml:"package"`
 }
 type RPMCandidate struct{ Name, EVR, Arch, Repo string }
 
@@ -1271,7 +1334,7 @@ func repoConfigured(name string) bool {
 
 func isRPM(id string) bool {
 	switch id {
-	case "rhel", "rocky", "almalinux", "centos", "ol":
+	case "rhel", "rocky", "almalinux", "centos", "ol", "fedora":
 		return true
 	}
 	return false
@@ -1843,9 +1906,41 @@ gpgcheck=0
 			restore()
 			return nil, fmt.Errorf("no official RHEL repository template for major version %s", major)
 		}
+	case "fedora":
+		content = fmt.Sprintf(`[official-everything]
+name=Official Fedora Everything
+baseurl=https://dl.fedoraproject.org/pub/fedora/linux/releases/%s/Everything/x86_64/os/
+enabled=1
+gpgcheck=0
 
+[official-updates]
+name=Official Fedora Updates
+baseurl=https://dl.fedoraproject.org/pub/fedora/linux/updates/%s/Everything/x86_64/
+enabled=1
+gpgcheck=0
+`, major, major)
 	case "ol":
-		content = fmt.Sprintf(`[official-baseos]
+		if major == "10" {
+			content = fmt.Sprintf(`[official-baseos]
+name=Official Oracle Linux BaseOS
+baseurl=https://yum.oracle.com/repo/OracleLinux/OL%s/baseos/latest/x86_64/
+enabled=1
+gpgcheck=0
+
+[official-appstream]
+name=Official Oracle Linux AppStream
+baseurl=https://yum.oracle.com/repo/OracleLinux/OL%s/appstream/x86_64/
+enabled=1
+gpgcheck=0
+
+[official-uekr8]
+name=Official Oracle Linux UEKR8
+baseurl=https://yum.oracle.com/repo/OracleLinux/OL%s/UEKR8/x86_64/
+enabled=1
+gpgcheck=0
+`, major, major, major)
+		} else {
+			content = fmt.Sprintf(`[official-baseos]
 name=Official Oracle Linux BaseOS
 baseurl=https://yum.oracle.com/repo/OracleLinux/OL%s/baseos/latest/x86_64/
 enabled=1
@@ -1857,6 +1952,7 @@ baseurl=https://yum.oracle.com/repo/OracleLinux/OL%s/appstream/latest/x86_64/
 enabled=1
 gpgcheck=0
 `, major, major)
+		}
 
 	default:
 		restore()
@@ -1936,6 +2032,14 @@ func officialRPMRepos(id, version string) []string {
 			return []string{"https://cdn.redhat.com/content/dist/rhel/server/6/6Server/x86_64/os"}
 		}
 	case "ol":
+		if major == "10" {
+			return []string{
+				fmt.Sprintf("https://yum.oracle.com/repo/OracleLinux/OL%s/baseos/latest/x86_64/", major),
+				fmt.Sprintf("https://yum.oracle.com/repo/OracleLinux/OL%s/appstream/x86_64/", major),
+				fmt.Sprintf("https://yum.oracle.com/repo/OracleLinux/OL%s/UEKR8/x86_64/", major),
+			}
+		}
+		// OL 8/9 fall back to original behavior (UEK may be in baseos or separate repos).
 		return []string{
 			fmt.Sprintf("https://yum.oracle.com/repo/OracleLinux/OL%s/baseos/latest/x86_64/", major),
 			fmt.Sprintf("https://yum.oracle.com/repo/OracleLinux/OL%s/appstream/latest/x86_64/", major),
@@ -1991,6 +2095,32 @@ func main() {
 		}
 	}
 	verboseMode = verbose
+
+	// 1) Must be root: we mutate /etc, /boot and run apt-get / dnf / grub2-mkconfig.
+	requireRoot()
+
+	// 2) Serialize concurrent runs. Done before showLogo/setupLog so a second
+	//    instance does not touch the log file or print the banner.
+	lp := lockPath()
+	lk, holderPID, lockErr := acquireLock(lp)
+	if lockErr != nil {
+		if errors.Is(lockErr, errLocked) {
+			if holderPID > 0 {
+				fmt.Fprintf(os.Stderr, "%s%s is already locked by PID %d%s\n\n",
+					yellow, lp, holderPID, reset)
+			} else {
+				fmt.Fprintf(os.Stderr, "%s%s is already locked%s\n\n",
+					yellow, lp, reset)
+			}
+			os.Exit(1)
+		}
+		// Non-fatal: warn and continue (e.g. read-only /run inside odd chroots).
+		fmt.Fprintf(os.Stderr, "%sWarning%s cannot acquire lock %s: %v\n",
+			yellow, reset, lp, lockErr)
+	} else {
+		defer lk.Release()
+	}
+
 	showLogo()
 
 	if err := setupLog(); err != nil {
