@@ -55,10 +55,10 @@ func showLogo() {
 		`|____|_|\_\ \___/ `,
 	}
 	for _, line := range logo {
-		fmt.Println(line)
+		fmt.Printf("  %s\n", line)
 		time.Sleep(100 * time.Millisecond)
 	}
-	fmt.Printf("\n%sv%s%s (Linux kernel updater)\n\n", yellow, appVersion, reset)
+	fmt.Printf("\n  %sv%s%s (Linux kernel updater)\n\n", yellow, appVersion, reset)
 }
 
 // requireRoot exits with a clear message if the process is not running as root.
